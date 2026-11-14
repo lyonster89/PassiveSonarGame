@@ -33,6 +33,8 @@ physics constant is cited or marked invented.
 
 - `tools/browser_check.py web OUT_DIR` plays a hunt in headless Chrome at laptop
   and phone sizes. Add `gpu` to run with software WebGPU.
+- `tools/full_review.py web` drives every control and checks what depends on
+  it: 80-odd checks across laptop, phone and failure cases.
 - `tools/gpu_offscreen_check.py web OUT.png` draws the WebGPU ray shader to an
   off-screen texture and reads it back.
 

@@ -20,15 +20,19 @@
     rayLayer: null, rayLayerKey: '', touched: false,
   };
 
-  const worker = new Worker('worker.js');
+  let worker;
+  try { worker = new Worker('worker.js'); }
+  catch (e) { worker = { postMessage() {} }; setTimeout(() => fail('This browser cannot run the simulation worker.'), 0); }
+  function fail(text) { const el = $('hint'); el.textContent = 'The simulation could not start. ' + text; el.classList.add('err'); }
+  setTimeout(() => { if (!S.ready && !$('hint').classList.contains('err')) $('hint').textContent = 'Still loading the simulation. If this does not change, reload the page.'; }, 12000);
   worker.onmessage = e => {
     const m = e.data;
     if (m.type === 'ready') onReady(m);
     else if (m.type === 'rays') onRays(m);
     else if (m.type === 'state') onState(m);
-    else if (m.type === 'error') { $('hint').textContent = 'The simulation could not start: ' + m.message; $('hint').classList.add('err'); }
+    else if (m.type === 'error') fail(m.message);
   };
-  worker.onerror = e => { $('hint').textContent = 'The simulation could not start in this browser.'; $('hint').classList.add('err'); };
+  worker.onerror = () => fail('Its files did not load; check the connection and reload.');
 
 
   // ------------------------------------------------- WebGPU ray-fan drawing
@@ -267,6 +271,12 @@ struct VOut {
     g.textAlign = 'left'; g.fillStyle = INK(0.9);
     g.fillText('listener', G.x0 + 13, ly + (ly < G.y0 + 16 ? 12 : -10));
 
+    const hv = S.hover;
+    if (hv && hv.view === 'ray' && hv.x >= G.x0 && hv.x <= G.x1 && hv.y >= G.y0 && hv.y <= G.y1) {
+      g.strokeStyle = INK(0.55); g.lineWidth = 1; g.beginPath();
+      g.moveTo(G.x0, Math.round(hv.y) + 0.5); g.lineTo(G.x1, Math.round(hv.y) + 0.5);
+      g.moveTo(Math.round(hv.x) + 0.5, G.y0); g.lineTo(Math.round(hv.x) + 0.5, G.y1); g.stroke();
+    }
     // the contact is only shown once the hunt is over
     if (S.done && S.out) {
       const km = S.out[24];
@@ -316,11 +326,12 @@ struct VOut {
   }
 
   // -------------------------------------------------------------- waterfall
+  const wfGeom = (w, h) => ({ x0: 58, x1: w - 10, y0: 26, y1: h - 8, rh: (h - 8 - 26) / STEPS });
   function hash(n) { let x = Math.imul(n ^ 0x9e3779b9, 0x85ebca6b); x ^= x >>> 13; x = Math.imul(x, 0xc2b2ae35); return ((x ^ (x >>> 16)) >>> 0) / 4294967296; }
   function drawWf() {
     const [g, w, h] = fit($('cWf'));
     g.clearRect(0, 0, w, h);
-    const x0 = 58, x1 = w - 10, y0 = 26, y1 = h - 8, rh = (y1 - y0) / STEPS;
+    const { x0, x1, y0, y1, rh } = wfGeom(w, h);
     const center = S.center == null ? 0 : S.center;
     const X = b => x0 + ((wrap180(b - center) + 180) / 360) * (x1 - x0);
     g.font = MONO; g.textBaseline = 'middle';
@@ -346,6 +357,12 @@ struct VOut {
       g.fillStyle = AMBER(1); g.fillRect(x - 1, y, 2, Math.max(1, rh));
     }
     if (!n) { g.fillStyle = INK(0.6); g.textAlign = 'center'; g.fillText('Bearings appear here once the hunt starts', (x0 + x1) / 2, (y0 + y1) / 2); }
+    const hv = S.hover;
+    if (hv && hv.view === 'wf' && wfAt(hv)) {
+      g.strokeStyle = INK(0.55); g.lineWidth = 1; g.beginPath();
+      g.moveTo(x0, Math.round(hv.y) + 0.5); g.lineTo(x1, Math.round(hv.y) + 0.5);
+      g.moveTo(Math.round(hv.x) + 0.5, y0); g.lineTo(Math.round(hv.x) + 0.5, y1); g.stroke();
+    }
   }
 
   // ------------------------------------------------------------------ chart
@@ -362,9 +379,14 @@ struct VOut {
     if (started) reach = Math.max(reach, Math.hypot(o[10] - ox, o[11] - oy) + 2.2 * Math.sqrt(Math.max(o[12], o[14])));
     if (S.done && o) reach = Math.max(reach, o[24]);
     reach = Math.min(Math.max(reach, guess().range) * 1.12, 170);
-    S.reach = S.reach ? S.reach + (reach - S.reach) * 0.25 : reach;
+    // ease the zoom only when the hunt or your answer changed, not on every
+    // redraw, so pointing at the chart never makes it drift
+    if (!S.reach) S.reach = reach;
+    else if (S.ease) S.reach += (reach - S.reach) * 0.25;
+    S.ease = false;
     const sc = Math.min(w, h) / 2 / S.reach, cx = w / 2, cy = h / 2;
     const X = x => cx + (x - ox) * sc, Y = y => cy - (y - oy) * sc;
+    S.plotT = { cx, cy, sc };
     // range rings
     const ringStep = S.reach > 90 ? 40 : S.reach > 45 ? 20 : 10;
     g.strokeStyle = INK(0.14); g.fillStyle = INK(0.6); g.textAlign = 'left'; g.lineWidth = 1;
@@ -420,12 +442,111 @@ struct VOut {
       g.beginPath(); g.moveTo(X(o[20]), Y(o[21])); g.lineTo(X(o[20]) + len * Math.sin(ca), Y(o[21]) - len * Math.cos(ca)); g.stroke();
       g.fillStyle = INK(0.9); g.textAlign = 'left'; g.fillText('the contact', X(o[20]) + 10, Y(o[21]) + 12);
     }
+    // the moment pointed at in the waterfall: where you were, and that bearing
+    const hv = S.hover;
+    if (hv && hv.view === 'wf') {
+      const at = wfAt(hv);
+      if (at && at.m) {
+        const m = at.m, a = m.b * Math.PI / 180;
+        if (m.det) { g.strokeStyle = AMBER(1); g.lineWidth = 2.2; g.beginPath(); g.moveTo(X(m.x), Y(m.y)); g.lineTo(X(m.x + 400 * Math.sin(a)), Y(m.y + 400 * Math.cos(a))); g.stroke(); }
+        g.fillStyle = PAPER; g.strokeStyle = INK(1); g.lineWidth = 1.6; g.beginPath(); g.arc(X(m.x), Y(m.y), 4.5, 0, 7); g.fill(); g.stroke();
+      }
+    }
+    // pointer on the chart: a line from your ship to the pointer
+    if (hv && hv.view === 'plot') {
+      g.strokeStyle = INK(0.55); g.lineWidth = 1; g.setLineDash([2, 3]); g.beginPath(); g.moveTo(cx, cy); g.lineTo(hv.x, hv.y); g.stroke(); g.setLineDash([]);
+      g.beginPath(); g.arc(hv.x, hv.y, 3, 0, 7); g.fillStyle = INK(0.8); g.fill();
+    }
     // own ship
     const hd = (o ? o[3] : 0) * Math.PI / 180;
     g.save(); g.translate(cx, cy); g.rotate(hd); g.fillStyle = INK(1);
     g.beginPath(); g.moveTo(0, -9); g.lineTo(6, 7); g.lineTo(-6, 7); g.closePath(); g.fill(); g.restore();
   }
   function lastDetected() { for (let k = S.hist.length - 1; k >= 0; k--) if (S.hist[k].det) return S.hist[k]; return null; }
+
+
+  // ----------------------------------------- live readout under the pointer
+  // Each view reports the position under the pointer in its own units. The
+  // waterfall also links across: the moment pointed at is marked on the
+  // chart, and its signal quality replaces the ocean view's label.
+  const sigOf = m => !m.det ? 'lost in a shadow zone'
+    : m.zone >= 2 ? `strong, clear path (±${m.sig.toFixed(1)}°)`
+    : m.zone >= 1 ? `weak, sea-floor bounce (±${m.sig.toFixed(1)}°)`
+    : `very weak, no clear path (±${m.sig.toFixed(1)}°)`;
+  const ago = k => k ? '−' + (k * DT / 60).toFixed(1) + ' min' : 'now';
+  function wfAt(hv) {
+    const { x0, x1, y0, y1, rh } = wfGeom(hv.w, hv.h);
+    if (hv.x < x0 || hv.x > x1 || hv.y < y0 || hv.y > y1) return null;
+    const k = Math.min(STEPS - 1, Math.floor((hv.y - y0) / rh));
+    const center = S.center == null ? 0 : S.center;
+    const brg = ((center + ((hv.x - x0) / (x1 - x0)) * 360 - 180) % 360 + 360) % 360;
+    const row = S.hist.length - 1 - k;
+    return { k, brg, m: row >= 0 ? S.hist[row] : null };
+  }
+  function rayAt(hv) {
+    if (!S.profile) return null;
+    const G = rayGeom(hv.w, hv.h);
+    if (hv.y < G.y0 || hv.y > G.y1) return null;
+    const depth = (hv.y - G.y0) / (G.y1 - G.y0) * DEPTH;
+    const u = depth / DEPTH * (S.profile.length - 1), i = Math.min(S.profile.length - 2, Math.floor(u));
+    const speed = S.profile[i] + (u - i) * (S.profile[i + 1] - S.profile[i]);
+    if (hv.x <= G.pw) return { depth, speed };
+    if (hv.x < G.x0 || hv.x > G.x1) return null;
+    const km = (hv.x - G.x0) / (G.x1 - G.x0) * RANGE_KM;
+    const { covNr, covNz } = S.L;
+    const ir = Math.min(covNr - 1, Math.floor(km / RANGE_KM * covNr)), iz = Math.min(covNz - 1, Math.floor(depth / DEPTH * covNz));
+    return { depth, speed, km, zone: S.coverage[iz * covNr + ir] };
+  }
+  function plotAt(hv) {
+    const T = S.plotT; if (!T) return null;
+    const dx = (hv.x - T.cx) / T.sc, dy = (T.cy - hv.y) / T.sc;
+    return { km: Math.hypot(dx, dy), brg: (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360 };
+  }
+  const metres = v => (Math.round(v / 10) * 10).toLocaleString('en-US') + ' m';
+  function readouts() {
+    const hv = S.hover;
+    let sig = S.sigText || 'signal: none yet', wf = '', plot = '';
+    if (hv && hv.view === 'wf') {
+      const at = wfAt(hv);
+      if (at) {
+        wf = `${ago(at.k)} · bearing ${pad3(at.brg)}`;
+        if (at.m) sig = `at ${ago(at.k)}: ` + (at.m.det ? `heard at ${pad3(at.m.b)}, ` : '') + sigOf(at.m);
+      }
+    } else if (hv && hv.view === 'ray') {
+      const at = rayAt(hv);
+      if (at && at.km == null) sig = `depth ${metres(at.depth)} · sound speed ${at.speed.toFixed(0)} m/s`;
+      else if (at) sig = `${at.km.toFixed(1)} km · ${metres(at.depth)} · ${at.speed.toFixed(0)} m/s · ${at.zone >= 2 ? 'direct sound' : at.zone >= 1 ? 'sea-floor bounce only' : 'shadow'}`;
+    } else if (hv && hv.view === 'plot') {
+      const at = plotAt(hv);
+      if (at) plot = `bearing ${pad3(at.brg)} · ${at.km.toFixed(1)} km`;
+    }
+    $('sig').textContent = sig; $('wfOut').textContent = wf; $('plotOut').textContent = plot;
+  }
+  (() => {
+    let queued = false, lastView = null, touchTimer = null;
+    const refresh = () => {
+      if (queued) return; queued = true;
+      requestAnimationFrame(() => {
+        queued = false; readouts();
+        const v = S.hover ? S.hover.view : null;
+        if (v === 'ray' || lastView === 'ray') drawRay();
+        drawWf(); drawPlot(); lastView = v;
+      });
+    };
+    const bind = (id, view) => {
+      const c = $(id);
+      const set = e => { const r = c.getBoundingClientRect(); S.hover = { view, x: e.clientX - r.left, y: e.clientY - r.top, w: r.width, h: r.height }; refresh(); };
+      c.addEventListener('pointermove', e => { if (e.pointerType === 'mouse') set(e); });
+      c.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse' && S.hover) { S.hover = null; refresh(); } });
+      // touch: a tap shows the readout for a few seconds
+      c.addEventListener('pointerdown', e => {
+        if (e.pointerType === 'mouse') return;
+        set(e); clearTimeout(touchTimer);
+        touchTimer = setTimeout(() => { S.hover = null; refresh(); }, 4000);
+      });
+    };
+    bind('cRay', 'ray'); bind('cWf', 'wf'); bind('cPlot', 'plot');
+  })();
 
   // ------------------------------------------------------------------- hunt
   function onReady(m) {
@@ -444,27 +565,30 @@ struct VOut {
     S.course = 0; $('courseOut').textContent = '000°';
     $('result').hidden = true; $('result').innerHTML = ''; tourStep = -1; $('hint').dataset.k = '';
     $('go').textContent = 'Start'; $('go').disabled = false; $('commit').disabled = true;
-    $('sig').textContent = 'signal: none yet';
+    S.sigText = 'signal: none yet'; S.hover = null; readouts();
+    $('pfLive').textContent = 'Start a hunt to see the filter\'s numbers here.';
+    S.awaitFresh = true;
     worker.postMessage({ type: 'reset', seed });
     hint();
   }
   function onState(m) {
     S.waiting = false;
     const o = m.out; S.out = o;
-    if (m.fresh) { S.track = [[o[1], o[2]]]; drawAll(); return; }
+    if (m.fresh) { S.awaitFresh = false; S.hist = []; S.center = null; S.track = [[o[1], o[2]]]; drawAll(); return; }
+    if (S.awaitFresh) return;   // a step from the previous hunt that was still in flight
     const det = o[5] > 0;
     if (det && S.center == null) S.center = o[6];
     S.hist.push({ i: o[19], b: o[6], sig: o[7], det, se: o[8], zone: o[9], x: o[1], y: o[2] });
     S.track.push([o[1], o[2]]);
-    $('sig').textContent = !det ? 'signal: lost in a shadow zone'
-      : o[9] >= 2 ? `signal: strong, clear path (±${o[7].toFixed(1)}°)`
-      : `signal: weak, sea-floor bounce (±${o[7].toFixed(1)}°)`;
+    S.sigText = 'signal: ' + sigOf(S.hist[S.hist.length - 1]);
+    readouts();
     if (o[26] > 0) {
       const sd = Math.sqrt(Math.max(o[12], o[14]));
       $('pfLive').innerHTML = `<b>Live from the hunt.</b> Estimated range ${o[15].toFixed(1)} km, give or take about ${sd.toFixed(1)} km. Course ${pad3(o[16])}, speed ${o[17].toFixed(1)} kn. Guesses still carrying weight: ${(100 * o[18]).toFixed(0)}%.`;
       $('commit').disabled = S.done;
     }
     if (o[19] >= STEPS && !S.done) finish(false);
+    S.ease = true;
     drawWf(); drawPlot(); hint();
   }
   function tick() {
@@ -560,7 +684,7 @@ struct VOut {
   $('speed').oninput = e => { S.speed = +e.target.value; $('speedOut').textContent = S.speed + ' kn'; };
   $('depth').oninput = e => { S.depth = +e.target.value; $('depthOut').textContent = S.depth + ' m'; requestTrace(); };
   $('axis').oninput = e => { S.axis = +e.target.value; $('axisOut').textContent = S.axis + ' m'; requestTrace(); };
-  $('gRange').oninput = e => { $('gRangeOut').textContent = e.target.value + ' km'; drawPlot(); };
+  $('gRange').oninput = e => { $('gRangeOut').textContent = e.target.value + ' km'; S.ease = true; drawPlot(); };
   $('gCourse').oninput = e => { $('gCourseOut').textContent = pad3(+e.target.value); drawPlot(); };
   $('gSpeed').oninput = e => { $('gSpeedOut').textContent = e.target.value + ' kn'; drawPlot(); };
   $('commit').onclick = () => { if (!S.done && S.hist.length) finish(true); };
