@@ -154,3 +154,41 @@ fn every_physics_constant_is_cited_or_marked_fictional() {
         prev_doc.clear();
     }
 }
+
+#[test]
+fn rays_match_the_bellhop_reference_model() {
+    // Reference paths were produced once by BELLHOP and stored as data; see
+    // the header of the CSV for how. No BELLHOP code is used here.
+    let p = Profile::Munk { axis: 1300.0 };
+    let table = Table::new(&p);
+    let data = include_str!("../tests/data/bellhop_munk_rays.csv");
+    let mut by_ray: Vec<(f64, Vec<(f64, f64)>)> = vec![];
+    for line in data.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        let v: Vec<f64> = line.split(',').map(|x| x.parse().unwrap()).collect();
+        if by_ray.last().map(|r| r.0) != Some(v[0]) {
+            by_ray.push((v[0], vec![]));
+        }
+        by_ray.last_mut().unwrap().1.push((v[1], v[2]));
+    }
+    assert_eq!(by_ray.len(), 7);
+    let (mut worst_clean, mut worst_bounced): (f64, f64) = (0.0, 0.0);
+    for (alpha, reference) in &by_ray {
+        let mut mine: Vec<(f64, f64)> = vec![(0.0, 300.0)];
+        let ray = trace_ray(&table, 300.0, alpha.to_radians(), MAX_RANGE + 200.0, 99, |r, z, _| mine.push((r, z)));
+        let mut worst: f64 = 0.0;
+        let mut k = 0;
+        for &(r, z) in reference {
+            if r > mine.last().unwrap().0 { break; }
+            while mine[k + 1].0 < r { k += 1; }
+            let f = (r - mine[k].0) / (mine[k + 1].0 - mine[k].0);
+            let zi = mine[k].1 + f * (mine[k + 1].1 - mine[k].1);
+            worst = worst.max((zi - z).abs());
+        }
+        let bounces = ray.bottom_bounces + ray.surface_bounces;
+        println!("ray {:+5.1} deg: worst depth difference {:7.2} m over 100 km ({} boundary bounces)", alpha, worst, bounces);
+        if bounces == 0 { worst_clean = worst_clean.max(worst) } else { worst_bounced = worst_bounced.max(worst) }
+    }
+    println!("worst, rays with no bounce: {:.2} m; rays that bounce: {:.2} m", worst_clean, worst_bounced);
+    assert!(worst_clean < 1.0);
+    assert!(worst_bounced < 20.0);
+}

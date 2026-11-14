@@ -43,8 +43,8 @@ pub const FICT_CONTACT_DEPTH: f64 = 10.0;
 pub const DT: f64 = 30.0;
 /// Ray fan: number of rays traced (see fan_angles).
 pub const N_RAYS: usize = 181;
-/// Every DRAW_EVERY-th ray is exported for drawing.
-pub const DRAW_EVERY: usize = 3;
+/// Every DRAW_EVERY-th ray is exported for drawing (1 = all of them).
+pub const DRAW_EVERY: usize = 1;
 pub const N_DRAW_RAYS: usize = (N_RAYS + DRAW_EVERY - 1) / DRAW_EVERY;
 pub const MAX_RANGE: f64 = 100_000.0;
 pub const RAY_STEP: f64 = 100.0;

@@ -30,6 +30,123 @@
   };
   worker.onerror = e => { $('hint').textContent = 'The simulation could not start in this browser.'; $('hint').classList.add('err'); };
 
+
+  // ------------------------------------------------- WebGPU ray-fan drawing
+  // Every traced ray is drawn as GPU line segments with alpha blending, so
+  // places where many rays cross (caustics) come out darker. If WebGPU is
+  // missing or fails at any point, the Canvas 2D path draws the rays instead.
+  const GPU = { ok: false };
+  const WGSL = `
+struct U { rect: vec4f, params: vec4f };
+@group(0) @binding(0) var<uniform> u: U;
+struct VOut {
+  @builtin(position) pos: vec4f,
+  @location(0) bounce: f32,
+  @location(1) frac: f32,
+};
+@vertex fn vs(@location(0) p: vec3f) -> VOut {
+  var o: VOut;
+  let fx = p.x / 100000.0;   // range, 0 to 100 km
+  let fy = p.y / 5000.0;     // depth, 0 to 5000 m
+  o.pos = vec4f(mix(u.rect.x, u.rect.z, fx), mix(u.rect.y, u.rect.w, fy), 0.0, 1.0);
+  o.bounce = p.z;
+  o.frac = fx;
+  return o;
+}
+@fragment fn fs(i: VOut) -> @location(0) vec4f {
+  if (i.frac > u.params.x) { discard; }
+  let a = select(0.30, 0.055, i.bounce > 0.5);
+  return vec4f(vec3f(0.055, 0.106, 0.165) * a, a);   // premultiplied ink
+}`;
+  async function initGpu() {
+    try {
+      if (!navigator.gpu) return;
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) return;
+      const device = await adapter.requestDevice();
+      const canvas = $('cRayGpu');
+      const ctx = canvas.getContext('webgpu');
+      if (!ctx) return;
+      const format = navigator.gpu.getPreferredCanvasFormat();
+      ctx.configure({ device, format, alphaMode: 'premultiplied' });
+      device.pushErrorScope('validation');
+      const module = device.createShaderModule({ code: WGSL });
+      const blend = { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' };
+      const pipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module, entryPoint: 'vs', buffers: [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] }] },
+        fragment: { module, entryPoint: 'fs', targets: [{ format, blend: { color: blend, alpha: blend } }] },
+        primitive: { topology: 'line-list' },
+        multisample: { count: 4 },
+      });
+      const ubuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const bind = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubuf } }] });
+      const err = await device.popErrorScope();
+      if (err) return;
+      Object.assign(GPU, { ok: true, device, ctx, format, pipeline, ubuf, bind, vbuf: null, vbufBytes: 0, count: 0, msaa: null, msaaKey: '' });
+      device.lost.then(info => gpuOff(info));
+      device.onuncapturederror = ev => gpuOff(ev.error);
+    } catch (e) { GPU.ok = false; console.warn('WebGPU not available:', e.message || e); }
+  }
+  function gpuOff(why) {
+    if (!GPU.ok) return;
+    console.warn('WebGPU drawing turned off, using Canvas 2D:', why && (why.message || why.reason || why));
+    GPU.ok = false; $('cRayGpu').style.display = 'none'; S.rayLayerKey = '';
+    S.rayReveal = 1;   // do not rely on animation frames after a GPU failure
+    drawRay(); drawNote();
+  }
+  function gpuUpload() {
+    const { nDrawRays, rayPts } = S.L, r = S.rays;
+    const v = new Float32Array(nDrawRays * (rayPts - 1) * 6);
+    let n = 0;
+    for (let i = 0; i < nDrawRays; i++) {
+      for (let k = 0; k < rayPts - 1; k++) {
+        const a = (i * rayPts + k) * 3, b = a + 3;
+        if (r[b] !== r[b]) break;            // NaN marks the end of a ray
+        const bounce = r[b + 2] > 0 ? 1 : 0;
+        v[n++] = r[a]; v[n++] = r[a + 1]; v[n++] = bounce;
+        v[n++] = r[b]; v[n++] = r[b + 1]; v[n++] = bounce;
+      }
+    }
+    if (!GPU.vbuf || GPU.vbufBytes < v.byteLength) {
+      if (GPU.vbuf) GPU.vbuf.destroy();
+      GPU.vbuf = GPU.device.createBuffer({ size: v.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      GPU.vbufBytes = v.byteLength;
+    }
+    GPU.device.queue.writeBuffer(GPU.vbuf, 0, v, 0, n);
+    GPU.count = n / 3;
+  }
+  function gpuRender(G, w, h, d) {
+    if (!GPU.vbuf || !GPU.count) return;
+    try {
+      const c = $('cRayGpu'), W = Math.max(1, Math.round(w * d)), H = Math.max(1, Math.round(h * d));
+      if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+      const key = W + 'x' + H;
+      if (GPU.msaaKey !== key) {
+        if (GPU.msaa) GPU.msaa.destroy();
+        GPU.msaa = GPU.device.createTexture({ size: [W, H], sampleCount: 4, format: GPU.format, usage: GPUTextureUsage.RENDER_ATTACHMENT });
+        GPU.msaaKey = key;
+      }
+      // plot rectangle in clip space (y up), then the reveal fraction
+      const u = new Float32Array([G.x0 / w * 2 - 1, 1 - G.y0 / h * 2, G.x1 / w * 2 - 1, 1 - G.y1 / h * 2, S.rayReveal, 0, 0, 0]);
+      GPU.device.queue.writeBuffer(GPU.ubuf, 0, u);
+      const enc = GPU.device.createCommandEncoder();
+      const pass = enc.beginRenderPass({ colorAttachments: [{
+        view: GPU.msaa.createView(), resolveTarget: GPU.ctx.getCurrentTexture().createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'discard' }] });
+      pass.setPipeline(GPU.pipeline);
+      pass.setBindGroup(0, GPU.bind);
+      pass.setVertexBuffer(0, GPU.vbuf);
+      pass.draw(GPU.count);
+      pass.end();
+      GPU.device.queue.submit([enc.finish()]);
+    } catch (e) { gpuOff(e); }
+  }
+  function drawNote() {
+    if (!S.L) return;
+    $('bDraw').textContent = GPU.ok ? `WebGPU, ${S.L.nDrawRays} rays` : `Canvas 2D, ${Math.ceil(S.L.nDrawRays / 3)} rays`;
+  }
+
   // ------------------------------------------------------------ canvas help
   function fit(c) {
     const r = c.getBoundingClientRect();
@@ -48,20 +165,18 @@
     const pw = Math.max(64, Math.min(120, w * 0.2));
     return { pw, x0: pw + 40, x1: w - 12, y0: 30, y1: h - 10 };
   }
-  function drawRayLayer(w, h, d) {
-    const key = `${w}x${h}x${d}`;
-    if (!S.rayLayer) S.rayLayer = document.createElement('canvas');
-    const c = S.rayLayer;
-    c.width = Math.round(w * d); c.height = Math.round(h * d);
-    S.rayLayerKey = key;
-    const g = c.getContext('2d');
-    g.setTransform(d, 0, 0, d, 0, 0);
+  // Canvas 2D fallback: every third ray as two paths (direct, and after a
+  // sea-floor bounce). The paths are plain geometry kept in memory, so they
+  // survive anything that happens to the graphics process.
+  function rayPaths(w, h) {
+    const key = `${w}x${h}`;
+    if (S.rayLayerKey === key && S.rayLayer) return S.rayLayer;
     const G = rayGeom(w, h);
     const X = r => G.x0 + (r / (RANGE_KM * 1000)) * (G.x1 - G.x0);
     const Y = z => G.y0 + (z / DEPTH) * (G.y1 - G.y0);
     const { nDrawRays, rayPts } = S.L;
     const direct = new Path2D(), bounced = new Path2D();
-    for (let i = 0; i < nDrawRays; i++) {
+    for (let i = 0; i < nDrawRays; i += 3) {
       let prevB = -1, pen = false;
       for (let k = 0; k < rayPts; k++) {
         const o = (i * rayPts + k) * 3;
@@ -76,9 +191,9 @@
         prevB = b;
       }
     }
-    g.lineWidth = 0.8;
-    g.strokeStyle = INK(0.10); g.stroke(bounced);
-    g.strokeStyle = INK(0.42); g.stroke(direct);
+    S.rayLayerKey = key;
+    S.rayLayer = { direct, bounced };
+    return S.rayLayer;
   }
   function drawRay() {
     const c = $('cRay');
@@ -125,12 +240,16 @@
     g.fillText('surface', G.x0 - 5, G.y0 + 2);
 
     // rays (cached layer), drawn outward once on load
-    const key = `${w}x${h}x${d}`;
-    if (S.rayLayerKey !== key) drawRayLayer(w, h, d);
-    g.save();
-    g.beginPath(); g.rect(G.x0, G.y0, (G.x1 - G.x0) * S.rayReveal, G.y1 - G.y0); g.clip();
-    g.drawImage(S.rayLayer, 0, 0, w, h);
-    g.restore();
+    if (GPU.ok) gpuRender(G, w, h, d);
+    else {
+      const paths = rayPaths(w, h);
+      g.save();
+      g.beginPath(); g.rect(G.x0, G.y0, (G.x1 - G.x0) * S.rayReveal, G.y1 - G.y0); g.clip();
+      g.lineWidth = 0.8;
+      g.strokeStyle = INK(0.10); g.stroke(paths.bounced);
+      g.strokeStyle = INK(0.42); g.stroke(paths.direct);
+      g.restore();
+    }
 
     // which paths reach a ship at the surface
     const { covNr } = S.L;
@@ -167,6 +286,7 @@
   function onRays(m) {
     S.rays = m.rays; S.profile = m.profile; S.coverage = m.coverage;
     S.rayLayerKey = '';
+    if (GPU.ok) { try { gpuUpload(); } catch (e) { gpuOff(e); } }
     S.tracePending = false;
     if (S.traceQueued) { S.traceQueued = false; requestTrace(); }
     if (S.rayReveal < 1 && !S.revealing) {
@@ -174,6 +294,8 @@
       const t0 = performance.now();
       const tick = t => { S.rayReveal = Math.min(1, (t - t0) / 900); drawRay(); if (S.rayReveal < 1) requestAnimationFrame(tick); };
       requestAnimationFrame(tick);
+      // if animation frames stall for any reason, show the rays anyway
+      setTimeout(() => { if (S.rayReveal < 1) { S.rayReveal = 1; drawRay(); } }, 1500);
     } else drawRay();
     clearZoneText();
   }
@@ -312,6 +434,7 @@
     $('bStep').textContent = m.bench.stepMs.toFixed(2) + ' ms';
     $('bSize').textContent = (m.wasmBytes / 1024).toFixed(0) + ' kB';
     $('go').disabled = false; $('fresh').disabled = false;
+    drawNote();
     requestTrace();
     newHunt(S.seed);
   }
@@ -319,7 +442,7 @@
     S.seed = seed; S.running = false; S.done = false; S.waiting = false;
     S.hist = []; S.track = []; S.center = null; S.turnedAt = -1; S.reach = 0;
     S.course = 0; $('courseOut').textContent = '000°';
-    $('result').hidden = true; $('result').innerHTML = '';
+    $('result').hidden = true; $('result').innerHTML = ''; tourStep = -1; $('hint').dataset.k = '';
     $('go').textContent = 'Start'; $('go').disabled = false; $('commit').disabled = true;
     $('sig').textContent = 'signal: none yet';
     worker.postMessage({ type: 'reset', seed });
@@ -351,16 +474,45 @@
   }
   let timer = null;
   function setTimer() { clearInterval(timer); timer = setInterval(tick, S.fast ? 80 : 250); }
+  // Guided tour: five steps, each tied to what the visitor has just done.
+  // The step sets the hint text, outlines the control or view it is about,
+  // and on a phone swipes to the view it is about.
+  const TOUR = [
+    { spot: 'go', view: 0, text: 'Press Start. A ship is out there, and all you will get is the direction of its sound.' },
+    { spot: 'vWf', view: 1, text: 'The amber trace is the direction of the sound over time. One line of bearings fits many ranges, so the teal cloud on the chart is long.' },
+    { spot: 'turnBtns', view: 2, text: 'Now turn your ship with the course buttons. Moving across the line of sight is what reveals range.' },
+    { spot: 'vPlot', view: 2, text: 'Watch the teal cloud shrink as bearings from your new course rule out wrong ranges.' },
+    { spot: 'answer', view: 2, text: 'Set your answer with the three sliders, then commit. Turn again first if the cloud is still long.' },
+  ];
+  let tourStep = -1;
+  function tourAt() {
+    const n = S.hist.length;
+    if (!S.running && n === 0) return 0;
+    if (n < 24) return 1;
+    if (S.turnedAt < 0) return 2;
+    if (n - S.turnedAt < 40) return 3;
+    return 4;
+  }
+  function spotlight(id) {
+    document.querySelectorAll('.spot').forEach(e => e.classList.remove('spot'));
+    if (id) $(id).classList.add('spot');
+  }
   function hint() {
-    const n = S.hist.length, el = $('hint');
+    const el = $('hint');
     if (!S.ready) return;
-    if (S.done) { el.textContent = 'Hunt over. The amber dot is where the contact really was. Press New contact to try again.'; return; }
-    if (!S.running && n === 0) { el.textContent = 'Press Start. A ship is out there, and all you will get is the direction of its sound.'; return; }
-    if (!S.running) { el.textContent = 'Paused.'; return; }
-    if (n < 24) el.textContent = 'The amber trace is the direction of the sound over time. Notice how long the teal cloud is: many ranges fit so far.';
-    else if (S.turnedAt < 0) el.textContent = 'Now turn your ship with the course buttons. Moving across the line of sight is what reveals range.';
-    else if (n - S.turnedAt < 40) el.textContent = 'Watch the teal cloud shrink as bearings from your new course rule out wrong ranges.';
-    else el.textContent = 'Set your answer with the three sliders, then commit. Turn again if the cloud is still long.';
+    if (S.done) { tourStep = -1; spotlight('fresh'); el.textContent = 'Hunt over. The amber dot is where the contact really was. Press New contact to try again.'; return; }
+    if (!S.running && S.hist.length > 0) { el.textContent = 'Paused.'; el.dataset.k = ''; return; }
+    const k = tourAt();
+    if (k === tourStep && el.dataset.k === String(k)) return;
+    const moved = k !== tourStep;
+    tourStep = k; el.dataset.k = String(k);
+    el.innerHTML = `<span class="n">${k + 1} of ${TOUR.length}</span>`;
+    el.appendChild(document.createTextNode(TOUR[k].text));
+    spotlight(TOUR[k].spot);
+    // on a phone, bring the view this step is about into sight
+    const views = $('views');
+    if (moved && k > 0 && views.scrollWidth > views.clientWidth + 4)
+      views.scrollTo({ left: views.clientWidth * TOUR[k].view, behavior: reduced ? 'auto' : 'smooth' });
   }
   function finish(byPlayer) {
     S.done = true; S.running = false;
@@ -511,8 +663,13 @@
     place();
   })();
 
+  // If the browser's graphics process restarts, 2D canvases lose their
+  // contents; redraw everything when they come back.
+  ['cRay', 'cWf', 'cPlot', 'cAmb'].forEach(id => $(id).addEventListener('contextrestored', () => { S.rayLayerKey = ''; drawAll(); drawAmb(); }));
+
   let rz = null;
   addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { S.rayLayerKey = ''; drawAll(); drawAmb(); }, 80); });
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { drawAll(); drawAmb(); });
   setTimer(); drawAll(); drawAmb();
+  initGpu().then(() => { drawNote(); if (GPU.ok && S.rays) { try { gpuUpload(); } catch (e) { gpuOff(e); } drawRay(); } });
 })();
