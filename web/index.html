@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Find a ship you can only hear</title>
+<meta name="description" content="A passive sonar simulator that runs in your browser: ocean sound-ray tracing and bearings-only tracking, written in Rust and compiled to WebAssembly.">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#F3EFE6; --ink:#0E1B2A; --amber:#E08A1E; --teal:#1F8A8A;
+  --l0:#F3EFE6; --l1:#DCE5E3; --l2:#A9C3CC; --l3:#2F5871; --l4:#0E1B2A;
+  --serif:"Source Serif 4",Georgia,serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --gauge:76px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+body{margin:0;background:var(--l0);color:var(--ink);font:16px/1.55 var(--sans);-webkit-text-size-adjust:100%}
+.mono{font-family:var(--mono);font-size:12px;letter-spacing:.02em}
+h1,h2{font-family:var(--serif);font-weight:600;line-height:1.12;margin:0 0 .5em;letter-spacing:-.01em}
+h1{font-size:clamp(28px,3.3vw,42px)}
+h2{font-size:clamp(26px,3.6vw,38px)}
+p{margin:0 0 1em;max-width:64ch}
+a{color:inherit}
+button,input{font:inherit;color:inherit}
+
+/* ---- layers: each one is a depth; the bands between them are the descent */
+.layer{padding:56px 28px 64px calc(var(--gauge) + 28px);background:var(--bg);color:var(--fg);--rule:color-mix(in srgb,var(--fg) 28%,transparent)}
+.l0{--bg:var(--l0);--fg:var(--ink);padding-top:26px}
+.l1{--bg:var(--l1);--fg:var(--ink)}
+.l2{--bg:var(--l2);--fg:var(--ink)}
+.l3{--bg:var(--l3);--fg:var(--paper)}
+.l4{--bg:var(--l4);--fg:var(--paper);min-height:90vh}
+.descent{height:120px;display:flex;align-items:flex-end;padding:0 28px 14px calc(var(--gauge) + 28px);background:linear-gradient(var(--from),var(--to));color:var(--fg)}
+.d01{--from:var(--l0);--to:var(--l1);--fg:var(--ink)}
+.d12{--from:var(--l1);--to:var(--l2);--fg:var(--ink)}
+.d23{--from:var(--l2);--to:var(--l3);--fg:var(--paper)}
+.d34{--from:var(--l3);--to:var(--l4);--fg:var(--paper)}
+.inner{max-width:1240px}
+.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:40px;align-items:start}
+.note{border-top:1px solid var(--rule);padding-top:12px;font-size:14px}
+.live{font-family:var(--mono);font-size:13px;border:1px solid var(--rule);padding:10px 12px;margin:0 0 1em}
+.live b{font-weight:500}
+ol.steps{padding-left:1.2em;margin:0 0 1em;max-width:60ch}
+ol.steps li{margin-bottom:.4em}
+.formula{font-family:var(--mono);font-size:14px;margin:0 0 1em;padding-left:12px;border-left:1px solid var(--rule)}
+
+/* ---- depth gauge: the navigation */
+.gauge{position:fixed;left:0;top:0;bottom:0;width:var(--gauge);z-index:5;color:#fff;mix-blend-mode:difference;pointer-events:none}
+.gauge-line{position:absolute;left:22px;top:24px;bottom:24px;width:1px;background:currentColor}
+.gauge a{position:absolute;left:22px;transform:translateY(-50%);padding:6px 0 6px 12px;font-family:var(--mono);font-size:10.5px;text-decoration:none;pointer-events:auto;white-space:nowrap;opacity:.75}
+.gauge a::before{content:"";position:absolute;left:0;top:50%;width:8px;height:1px;background:currentColor}
+.gauge a[aria-current="true"]{opacity:1;font-weight:500}
+.gauge-mark{position:absolute;left:14px;width:17px;height:17px;margin-top:-8px;border:1px solid currentColor;border-radius:50%;background:currentColor}
+.gauge-read{position:fixed;right:10px;top:10px;z-index:6;color:var(--ink);background:var(--paper);border:1px solid var(--ink);padding:2px 7px;font-family:var(--mono);font-size:11px;pointer-events:none}
+
+/* ---- the hunt */
+.mast{display:flex;flex-wrap:wrap;gap:8px 40px;align-items:flex-end;margin-bottom:14px}
+.mast h1{margin:0;flex:1 1 380px}
+.mast .lede{flex:1 1 320px;margin:0;font-size:17px}
+.eyebrow{margin:0 0 6px;opacity:.75}
+.hint{font-family:var(--serif);font-size:18px;margin:0 0 12px;padding:8px 0 8px 12px;border-left:3px solid var(--amber);max-width:none;min-height:2.6em}
+.tabs{display:none}
+.views{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-areas:"ray ray" "wf plot";gap:14px}
+.view{margin:0;border:1px solid var(--ink);background:var(--paper);position:relative;min-width:0}
+.view.ray{grid-area:ray}.view.wf{grid-area:wf}.view.plot{grid-area:plot}
+.view figcaption{font-family:var(--mono);font-size:11.5px;padding:6px 10px;border-bottom:1px solid var(--ink);display:flex;justify-content:space-between;gap:10px}
+.view canvas{display:block;width:100%;height:290px}
+.view.ray canvas{height:300px;cursor:ns-resize}
+.key{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 4px 0 10px;vertical-align:baseline}
+.stage{display:grid;grid-template-columns:minmax(0,1fr);gap:14px}
+.ocean{display:grid;grid-template-columns:1fr 1fr;gap:6px 22px;padding:8px 10px;border-top:1px solid var(--ink)}
+.helm{display:grid;grid-template-columns:1fr 1fr;gap:14px 22px;align-items:start;padding-top:12px;border-top:1px solid var(--ink)}
+.helm-main{display:flex;gap:14px 22px;flex-wrap:wrap}
+.helm-more{display:grid;gap:12px}
+.ctl{display:flex;flex-direction:column;gap:4px;min-width:0}
+.ctl > span{font-family:var(--mono);font-size:11px;display:flex;justify-content:space-between;gap:8px}
+.ctl output{font-weight:500}
+.row{display:flex;gap:8px;align-items:center}
+.btn{border:1px solid var(--ink);background:transparent;padding:9px 14px;min-height:42px;font-family:var(--mono);font-size:13px;cursor:pointer;border-radius:0;white-space:nowrap}
+.btn:hover{background:rgba(14,27,42,.07)}
+.btn.primary{background:var(--ink);color:var(--paper)}
+.btn.primary:hover{background:#1c3147}
+.btn:focus-visible,input:focus-visible,.gauge a:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.btn[disabled]{opacity:.4;cursor:default}
+input[type=range]{width:100%;accent-color:var(--ink);margin:0;height:24px}
+.answer{display:grid;gap:10px;border-top:1px dashed rgba(14,27,42,.4);border-bottom:1px dashed rgba(14,27,42,.4);padding:12px 0}
+.answer .ttl{font-family:var(--mono);font-size:11px;margin:0}
+@media (min-width:1100px){
+  .stage{grid-template-columns:minmax(0,1fr) 290px;gap:18px}
+  .helm{grid-template-columns:1fr;border-top:0;border-left:1px solid var(--ink);padding:0 0 0 18px;align-content:start}
+  .view.ray canvas{height:204px}
+  .view canvas{height:222px}
+  .mast{margin-bottom:10px}
+  .hint{margin-bottom:10px}
+  .l0{min-height:100vh}
+}
+table.res{border-collapse:collapse;font-family:var(--mono);font-size:13px;margin:14px 0 0;width:100%;max-width:640px}
+table.res th,table.res td{text-align:right;padding:6px 10px;border-bottom:1px solid rgba(14,27,42,.25)}
+table.res th:first-child,table.res td:first-child{text-align:left}
+#result p{font-family:var(--serif);font-size:18px;margin:14px 0 0}
+table.eng{border-collapse:collapse;font-size:14px;width:100%;margin:0 0 1.4em}
+table.eng th,table.eng td{text-align:left;padding:7px 10px 7px 0;border-bottom:1px solid var(--rule);vertical-align:top}
+table.eng td:last-child{font-family:var(--mono);font-size:13px;white-space:nowrap}
+table.eng th{font-family:var(--mono);font-size:11px;font-weight:400;opacity:.8}
+.mini{border:1px solid var(--rule);margin:0 0 1em}
+.mini canvas{display:block;width:100%;height:280px}
+.mini figcaption{font-family:var(--mono);font-size:11.5px;padding:8px 10px;border-top:1px solid var(--rule)}
+.src{font-size:14px;padding-left:1.1em}
+.src li{margin-bottom:.35em}
+.err{font-family:var(--mono);color:#8a1f1f}
+
+@media (max-width:820px){
+  :root{--gauge:0px}
+  .gauge{display:none}
+  .layer{padding:44px 16px 52px}
+  .l0{padding-top:44px}
+  .descent{padding:0 16px 12px;height:96px}
+  .cols{grid-template-columns:1fr;gap:8px}
+  .tabs{display:flex;gap:0;margin:0 0 8px;border:1px solid var(--ink)}
+  .tabs button{flex:1;border:0;border-right:1px solid var(--ink);background:transparent;padding:10px 4px;min-height:42px;font-family:var(--mono);font-size:12px}
+  .tabs button:last-child{border-right:0}
+  .tabs button[aria-selected="true"]{background:var(--ink);color:var(--paper)}
+  .views{display:flex;align-items:flex-start;overflow-x:auto;scroll-snap-type:x mandatory;gap:0;scrollbar-width:none}
+  .views::-webkit-scrollbar{display:none}
+  .view{flex:0 0 100%;scroll-snap-align:start}
+  .view canvas,.view.ray canvas{height:270px;cursor:default}
+  .ocean{grid-template-columns:1fr}
+  .helm{display:contents}
+  .helm-main{position:sticky;bottom:0;z-index:3;background:var(--l0);border-top:1px solid var(--ink);padding:8px 0 10px;flex-wrap:nowrap;justify-content:space-between;gap:10px}
+  .helm-main .btn{padding:9px 11px}
+  h1{font-size:28px}
+  .mast .lede{font-size:15px}
+  .mast{margin-bottom:10px}
+  .eyebrow{font-size:11px}
+  .hint{font-size:16px}
+}
+</style>
+</head>
+<body>
+
+<nav class="gauge" aria-label="Depth gauge: jump to a layer">
+  <div class="gauge-line"></div>
+  <div class="gauge-mark" id="gMark"></div>
+  <a href="#hunt" data-layer="hunt">Surface</a>
+  <a href="#sound" data-layer="sound">Shallow</a>
+  <a href="#waterfall" data-layer="waterfall">Mid</a>
+  <a href="#tracking" data-layer="tracking">Deep</a>
+  <a href="#engineering" data-layer="engineering">Floor</a>
+</nav>
+<div class="gauge-read" id="gRead" aria-hidden="true">depth 0 m</div>
+
+<main>
+<section class="layer l0" id="hunt">
+ <div class="inner">
+  <p class="eyebrow mono">Passive sonar simulator · everything is computed live in your browser</p>
+  <header class="mast">
+    <h1>Find a ship you can only hear.</h1>
+    <p class="lede">You get one clue: the direction its sound comes from. Work out how far away it is, where it is heading and how fast.</p>
+  </header>
+
+  <p class="hint" id="hint" aria-live="polite">Loading the simulation…</p>
+
+  <div class="tabs" role="tablist" aria-label="Views">
+    <button role="tab" aria-selected="true" data-view="0">Ocean</button>
+    <button role="tab" aria-selected="false" data-view="1">Waterfall</button>
+    <button role="tab" aria-selected="false" data-view="2">Chart</button>
+  </div>
+
+  <div class="stage">
+  <div class="views" id="views">
+    <figure class="view ray">
+      <figcaption><span>Ocean, side view · how sound travels from your listener</span><span id="sig">signal: none yet</span></figcaption>
+      <canvas id="cRay" aria-label="Side view of the ocean showing sound rays bending with depth"></canvas>
+      <div class="ocean">
+        <label class="ctl"><span>Listener depth <output id="depthOut">300 m</output></span><input type="range" id="depth" min="50" max="2500" step="10" value="300"></label>
+        <label class="ctl"><span>Depth where sound is slowest <output id="axisOut">1300 m</output></span><input type="range" id="axis" min="300" max="2500" step="10" value="1300"></label>
+      </div>
+    </figure>
+    <figure class="view wf">
+      <figcaption><span>Waterfall · direction of the sound, newest on top</span></figcaption>
+      <canvas id="cWf" aria-label="Waterfall display of bearing over time"></canvas>
+    </figure>
+    <figure class="view plot">
+      <figcaption><span>Chart, north up<i class="key" style="background:var(--teal)"></i>computer<i class="key" style="background:var(--paper);border:1.5px solid var(--ink)"></i>you</span></figcaption>
+      <canvas id="cPlot" aria-label="Chart from above showing your ship, the bearing lines and the estimated contact position"></canvas>
+    </figure>
+  </div>
+
+  <div class="helm">
+    <div class="helm-main">
+      <div class="ctl">
+        <span>Hunt</span>
+        <div class="row">
+          <button class="btn primary" id="go" disabled>Start</button>
+          <button class="btn" id="fast" aria-pressed="false">1×</button>
+        </div>
+      </div>
+      <div class="ctl">
+        <span>Your course <output id="courseOut">000°</output></span>
+        <div class="row">
+          <button class="btn" id="port" aria-label="Turn left 30 degrees">◀ 30°</button>
+          <button class="btn" id="stbd" aria-label="Turn right 30 degrees">30° ▶</button>
+        </div>
+      </div>
+    </div>
+    <div class="helm-more">
+      <label class="ctl"><span>Your speed <output id="speedOut">8 kn</output></span><input type="range" id="speed" min="4" max="16" step="1" value="8"></label>
+      <div class="answer">
+        <p class="ttl">YOUR ANSWER · where is the contact now?</p>
+        <label class="ctl"><span>Range <output id="gRangeOut">40 km</output></span><input type="range" id="gRange" min="5" max="150" step="1" value="40"></label>
+        <label class="ctl"><span>Its course <output id="gCourseOut">000°</output></span><input type="range" id="gCourse" min="0" max="355" step="5" value="0"></label>
+        <label class="ctl"><span>Its speed <output id="gSpeedOut">10 kn</output></span><input type="range" id="gSpeed" min="2" max="22" step="1" value="10"></label>
+        <button class="btn primary" id="commit" disabled>Commit answer</button>
+      </div>
+      <button class="btn" id="fresh" disabled>New contact</button>
+    </div>
+  </div>
+  </div>
+  <div id="result" hidden></div>
+ </div>
+</section>
+
+<div class="descent d01"><span class="mono">▼ going deeper · why the rays curve</span></div>
+
+<section class="layer l1" id="sound">
+ <div class="inner cols">
+  <div>
+    <h2>How sound bends</h2>
+    <p>Sound in the sea does not travel in straight lines. It bends toward water where it moves more slowly. Its speed depends on temperature and pressure, so it changes with depth: fast near the warm surface, slowest about a kilometre down, then faster again as the pressure builds.</p>
+    <p>That is why the rays in the ocean view curve. Shallow rays sink, turn around in the deep and climb back to the surface tens of kilometres away. Between where they leave and where they return, no direct sound arrives. That gap is a <b>shadow zone</b>. Steeper rays reach into it only by bouncing off the sea floor, which costs loudness.</p>
+  </div>
+  <div>
+    <p class="live" id="czLive">Tracing rays…</p>
+    <p>Try it: move the listener deeper, or change the depth where sound is slowest, and watch the clear zones move. A contact in a clear zone gives a sharp bearing. One in a shadow zone gives a blurred one, or none.</p>
+    <p class="note">The ocean here is Munk's standard deep-water profile, 5,000 m deep with a flat floor. Each ray is integrated with fourth-order Runge-Kutta in 100 m steps. On a sea-floor bounce a ray is drawn lighter, and it is dropped after two bounces.</p>
+  </div>
+ </div>
+</section>
+
+<div class="descent d12"><span class="mono">▼ going deeper · what the waterfall can and cannot tell you</span></div>
+
+<section class="layer l2" id="waterfall">
+ <div class="inner cols">
+  <div>
+    <h2>Reading the waterfall</h2>
+    <p>A <b>bearing</b> is the compass direction a sound arrives from. The waterfall plots one bearing every 30 seconds, newest on top. A strong signal draws a thin line. A weak one smears, because its direction is harder to pin down.</p>
+    <p>Here is the catch. Bearings alone do not give range. A slow ship nearby and a fast ship far away can draw exactly the same trace, as the chart on this layer shows.</p>
+    <p>The way out is to move. When the listener changes course, each candidate track would have shifted the bearings differently, and only one of them still fits. That is why turning your ship in the hunt makes the teal cloud collapse.</p>
+  </div>
+  <figure class="mini">
+    <canvas id="cAmb" aria-label="Several different contact tracks that produce identical bearings"></canvas>
+    <figcaption>
+      <label for="amb">Slide: every dashed track produces exactly the bearings drawn. <span id="ambOut"></span></label>
+      <input type="range" id="amb" min="0.4" max="2.2" step="0.02" value="1.6">
+    </figcaption>
+  </figure>
+ </div>
+</section>
+
+<div class="descent d23"><span class="mono">▼ going deeper · how the computer makes its estimate</span></div>
+
+<section class="layer l3" id="tracking">
+ <div class="inner cols">
+  <div>
+    <h2>The tracking math</h2>
+    <p>The teal cloud is 6,000 guesses. Each one is a complete story about the contact: where it is, which way it is going and how fast. Every 30 seconds:</p>
+    <ol class="steps">
+      <li>Each guess moves forward along its own course.</li>
+      <li>Each guess works out the bearing it would have produced.</li>
+      <li>Each guess is scored by how close that is to the bearing actually measured.</li>
+      <li>Poor guesses are dropped. Good ones are copied and nudged slightly, so the cloud keeps exploring.</li>
+    </ol>
+    <p class="formula">weight ∝ exp( −½ · (bearing error ÷ σ)² )</p>
+  </div>
+  <div>
+    <p class="live" id="pfLive">Start a hunt to see the filter's numbers here.</p>
+    <p>This is a particle filter. It suits the problem because the uncertainty starts as a long thin wedge along the first bearing, not a tidy ellipse, and simpler filters handle that shape badly.</p>
+    <p>σ, the blur on each bearing, comes from the passive sonar equation. Signal strength is the source's loudness, minus what the ocean takes away over the path, minus background noise, plus the gain of the listening array.</p>
+    <p class="formula">signal excess = SL − TL − NL + DI</p>
+    <p class="note">The nudge in step 4 is drawn from the cloud's own shape (its 4-by-4 covariance, scaled by a kernel bandwidth), a method called regularised resampling.</p>
+  </div>
+ </div>
+</section>
+
+<div class="descent d34"><span class="mono">▼ sea floor · how it is built and checked</span></div>
+
+<section class="layer l4" id="engineering">
+ <div class="inner cols">
+  <div>
+    <h2>Engineering notes</h2>
+    <p>The physics and the filter are about 800 lines of Rust with no dependencies, compiled to WebAssembly and run in a Web Worker so the page stays responsive. The page is plain JavaScript drawing on Canvas 2D. There is no framework, no backend and nothing to install.</p>
+    <table class="eng" aria-label="Measured on this device">
+      <tr><th>Measured on this device, just now</th><th></th></tr>
+      <tr><td>Trace 181 rays to 100 km</td><td id="bTrace">…</td></tr>
+      <tr><td>One filter step, 6,000 guesses</td><td id="bStep">…</td></tr>
+      <tr><td>Size of the simulation core</td><td id="bSize">…</td></tr>
+    </table>
+    <table class="eng" aria-label="Automated tests">
+      <tr><th>Automated tests, last build</th><th>Result</th></tr>
+      <tr><td>Ray in a constant-gradient ocean against the exact circle</td><td>&lt; 0.1 mm over 15 km</td></tr>
+      <tr><td>Turning depth against Snell's law</td><td>2095.8 m both ways</td></tr>
+      <tr><td>Drift of the ray invariant, worst of 244 rays</td><td>0.002%</td></tr>
+      <tr><td>Filter position error, median of 100 seeded hunts</td><td>19% → 4% of range</td></tr>
+      <tr><td>Truth inside the filter's 95% region</td><td>99 of 100 hunts</td></tr>
+      <tr><td>Same seed gives the same hunt, bit for bit</td><td>pass</td></tr>
+      <tr><td>Every physics constant cited or marked invented</td><td>pass</td></tr>
+    </table>
+  </div>
+  <div>
+    <h2>Sources</h2>
+    <p>Every formula comes from the open literature. The contact, its loudness, the background noise and the listening array are invented for the game and describe no real vessel or sensor.</p>
+    <ul class="src">
+      <li>W. H. Munk, "Sound channel in an exponentially stratified ocean", J. Acoust. Soc. Am., 1974.</li>
+      <li>Jensen, Kuperman, Porter, Schmidt, <i>Computational Ocean Acoustics</i>, 2nd ed., 2011.</li>
+      <li>R. J. Urick, <i>Principles of Underwater Sound</i>, 3rd ed., 1983.</li>
+      <li>Gordon, Salmond, Smith, "Novel approach to nonlinear/non-Gaussian Bayesian state estimation", 1993.</li>
+      <li>Arulampalam, Maskell, Gordon, Clapp, "A tutorial on particle filters", 2002.</li>
+      <li>Aidala, Hammel, "Utilization of modified polar coordinates for bearings-only tracking", 1983.</li>
+    </ul>
+    <p class="note">Built by John Lyon.</p>
+  </div>
+ </div>
+</section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
